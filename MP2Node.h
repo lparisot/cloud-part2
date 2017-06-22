@@ -19,6 +19,25 @@
 #include "Message.h"
 #include "Queue.h"
 
+typedef struct transactionInfo {
+	MessageType messageType;
+	int startTime;
+	int replyNumber;
+	string key;
+	string value;
+	bool failed;
+} TransactionInfo;
+
+#define REPLICA_NB 3
+#define QUORUM ((REPLICA_NB/2)+1)
+#define TIME_OUT 20
+#define STABILIZER_ID -1
+
+#define N_MINUS_2 	0
+#define N_MINUS_1		1
+#define N_PLUS_1		2
+#define N_PLUS_2 		3
+
 /**
  * CLASS NAME: MP2Node
  *
@@ -47,6 +66,27 @@ private:
 	EmulNet * emulNet;
 	// Object of Log
 	Log * log;
+	// transactions info
+	map<int, TransactionInfo> transInfos;
+
+private:
+	bool isSameNode(Node first, Node second);
+	int ifExistNode(vector<Node> v, Node n1);
+	vector<pair<string, string>> findKeys(ReplicaType rep_type);
+	void manageNeighbors();
+
+	void clientCreateOrUpdate(string key, string value, MessageType type);
+	void clientReadOrDelete(string key, MessageType type);
+
+	void processCreateMessage(Message *receivedMessage);
+	void processReadMessage(Message *receivedMessage);
+	void processUpdateMessage(Message *receivedMessage);
+	void processDeleteMessage(Message *receivedMessage);
+	void processReadReplyMessage(Message *receivedMessage);
+	void processReplyMessage(Message *receivedMessage);
+	void pushNewTransactionInfo(string key, string value, int transID, MessageType messageType);
+
+	void checkCoordinatorStatus();
 
 public:
 	MP2Node(Member *memberNode, Params *par, EmulNet *emulNet, Log *log, Address *addressOfMember);
@@ -58,7 +98,7 @@ public:
 	void updateRing();
 	vector<Node> getMembershipList();
 	size_t hashFunction(string key);
-	void findNeighbors();
+	vector<Node> findNeighbors(vector<Node> nodes);
 
 	// client side CRUD APIs
 	void clientCreate(string key, string value);
@@ -83,10 +123,10 @@ public:
 	bool createKeyValue(string key, string value, ReplicaType replica);
 	string readKey(string key);
 	bool updateKeyValue(string key, string value, ReplicaType replica);
-	bool deletekey(string key);
+	bool deleteKey(string key);
 
 	// stabilization protocol - handle multiple failures
-	void stabilizationProtocol();
+	void stabilizationProtocol(vector<Node> neighbors);
 
 	~MP2Node();
 };
