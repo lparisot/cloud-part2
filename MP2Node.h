@@ -37,6 +37,10 @@ typedef struct transactionInfo {
 #define N_MINUS_1		1
 #define N_PLUS_1		2
 #define N_PLUS_2 		3
+#define R_MINUS_2		0
+#define R_MINUS_1		1
+#define R_PLUS_1		0
+#define R_PLUS_2		1
 
 /**
  * CLASS NAME: MP2Node

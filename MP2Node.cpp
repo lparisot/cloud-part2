@@ -52,7 +52,7 @@ void MP2Node::updateRing() {
 	// Sort the list based on the hashCode
 	sort(curMemList.begin(), curMemList.end());
 
-	if(ring.size() == 10) {
+	if(ring.size() > 0) {
 		manageNeighbors();
 	}
 
@@ -71,7 +71,7 @@ void MP2Node::updateRing() {
 			change = true;
 		}
 	}
-    
+
 	ring = curMemList;
 
 	/*
@@ -130,7 +130,7 @@ void MP2Node::clientCreateOrUpdate(string key, string value, MessageType type) {
 
 	int transID = g_transID++;
 	Message message(transID, getMemberNode()->addr, type, key, value);
-    
+
     pushNewTransactionInfo(key, value, transID, type);
 
 	message.replica = ReplicaType::PRIMARY;
@@ -152,8 +152,8 @@ void MP2Node::clientReadOrDelete(string key, MessageType type) {
 	int transID = g_transID++;
 	Message message(transID, getMemberNode()->addr, type, key);
 
-    pushNewTransactionInfo(key, "", transID, type);
-    
+  pushNewTransactionInfo(key, "", transID, type);
+
 	this->emulNet->ENsend(&memberNode->addr, replicas[0].getAddress(), message.toString());
 	this->emulNet->ENsend(&memberNode->addr, replicas[1].getAddress(), message.toString());
 	this->emulNet->ENsend(&memberNode->addr, replicas[2].getAddress(), message.toString());
@@ -398,62 +398,162 @@ int MP2Node::enqueueWrapper(void *env, char *buff, int size) {
  *				Note:- "CORRECT" replicas implies that every key is replicated in its two neighboring nodes in the ring
  */
 void MP2Node::stabilizationProtocol(vector<Node> neighbors) {
-    
-    if(!isSameNode(haveReplicasOf[1], neighbors[N_MINUS_1])) {
-        // the neighbor -1 has failed. I'm now primary
-        for(map<string, string>::iterator it=ht->hashTable.begin(); it != ht->hashTable.end(); it++) {
-            Entry entry(it->second);
-            if(entry.replica == ReplicaType::SECONDARY) {
-                string key = it->first;
-                Message message(STABILIZER_ID, getMemberNode()->addr, MessageType::CREATE, key, entry.value);
-                message.replica = ReplicaType::SECONDARY;
-                this->emulNet->ENsend(&memberNode->addr, &neighbors[N_PLUS_1].nodeAddress, message.toString());
-                message.replica = ReplicaType::TERTIARY;
-                this->emulNet->ENsend(&memberNode->addr, &neighbors[N_PLUS_2].nodeAddress, message.toString());
-            }
-        }
-    }
-    
-    // check the first replic
-	if(!isSameNode(hasMyReplicas[0], neighbors[N_PLUS_1])) {
-        if(isSameNode(hasMyReplicas[1], neighbors[N_PLUS_1])) {
-            // failure of secondary replica. Tertiary become secondary
-            // my secondary replica has failed
-            for(map<string, string>::iterator it=ht->hashTable.begin(); it != ht->hashTable.end(); it++) {
-                Entry entry(it->second);
-                if(entry.replica == ReplicaType::PRIMARY) {
-                    string key = it->first;
-                    Message message(STABILIZER_ID, getMemberNode()->addr, MessageType::UPDATE, key, entry.value, ReplicaType::SECONDARY);
-                    this->emulNet->ENsend(&memberNode->addr, &neighbors[N_PLUS_1].nodeAddress, message.toString());
-                }
-            }
-        }
-        else {
-            // new node
-            for(map<string, string>::iterator it=ht->hashTable.begin(); it != ht->hashTable.end(); it++) {
-                Entry entry(it->second);
-                if(entry.replica == ReplicaType::PRIMARY) {
-                    string key = it->first;
-                    Message message(STABILIZER_ID, getMemberNode()->addr, MessageType::CREATE, key, entry.value, ReplicaType::SECONDARY);
-                    this->emulNet->ENsend(&memberNode->addr, &neighbors[N_PLUS_1].nodeAddress, message.toString());
-                }
-            }
-        }
+	///////////////////// Nodes for which I'm a replica
+	// only old node -2 failed
+	if(!isSameNode(haveReplicasOf[R_MINUS_2], neighbors[N_MINUS_2]) &&
+					isSameNode(haveReplicasOf[R_MINUS_1], neighbors[N_MINUS_1])) {
+		// done by code above
+		log->LOG(&memberNode->addr, "stabilizationProtocol: only node -2 failed");
 	}
-    
-    if(!isSameNode(hasMyReplicas[1], neighbors[N_PLUS_2])) {
-        // change in tertiary replica
-        for(map<string, string>::iterator it=ht->hashTable.begin(); it != ht->hashTable.end(); it++) {
-            Entry entry(it->second);
-            if(entry.replica == ReplicaType::PRIMARY) {
-                string key = it->first;
-                Message message(STABILIZER_ID, getMemberNode()->addr, MessageType::CREATE, key, entry.value, ReplicaType::TERTIARY);
-                this->emulNet->ENsend(&memberNode->addr, &neighbors[N_PLUS_2].nodeAddress, message.toString());
-            }
-        }
-    }
+	// old node -1 leave. old node -2 takes its place
+	else if(isSameNode(haveReplicasOf[R_MINUS_2], neighbors[N_MINUS_1]) &&
+					!isSameNode(haveReplicasOf[R_MINUS_2], neighbors[N_MINUS_2])) {
+		// previous node was a primary
+		// promote this one to primary replica (local)
+		// promote N_PLUS_1 to secondary (update)
+		// N_PLUS_2 become the tertiary (create)
+		log->LOG(&memberNode->addr, "stabilizationProtocol: old node -1 leave. old node -2 takes its place");
+		for(map<string, string>::iterator it=ht->hashTable.begin(); it != ht->hashTable.end(); it++) {
+			Entry entry(it->second);
+			string key = it->first;
+			if(entry.replica == ReplicaType::SECONDARY) {
+				// secondary data in this node will become primary
+				// update local
+				if(updateKeyValue(key, entry.value, PRIMARY)) {
+					log->logUpdateSuccess(&memberNode->addr, false, STABILIZER_ID, key, entry.value);
+				}
+				else {
+					log->logUpdateFail(&memberNode->addr, false, STABILIZER_ID, key, entry.value);
+				}
+				// old tertiary become secondary
+				Message message(STABILIZER_ID, getMemberNode()->addr, MessageType::UPDATE, key, entry.value, ReplicaType::SECONDARY);
+				this->emulNet->ENsend(&memberNode->addr, &neighbors[N_PLUS_1].nodeAddress, message.toString());
+				// a new tertiary is created
+				message.type = MessageType::CREATE;
+				message.replica = ReplicaType::TERTIARY;
+				this->emulNet->ENsend(&memberNode->addr, &neighbors[N_PLUS_2].nodeAddress, message.toString());
+			}
+		}
+	}
+	// both node -1 and -2 failed
+	else if(!isSameNode(haveReplicasOf[R_MINUS_2], neighbors[N_MINUS_2]) &&
+		 		  !isSameNode(haveReplicasOf[R_MINUS_1], neighbors[N_MINUS_1])) {
+		// 2 previous nodes failed
+		// promote this one to primary replica (local)
+		// N_PLUS_1 become the secondary (update/create)
+		// N_PLUS_2 become the tertiary (create)
+		log->LOG(&memberNode->addr, "stabilizationProtocol: both node -1 and -2 failed");
+		for(map<string, string>::iterator it=ht->hashTable.begin(); it != ht->hashTable.end(); it++) {
+      Entry entry(it->second);
+			string key = it->first;
+      if(entry.replica == ReplicaType::SECONDARY) {
+				// we were the secondary of node -1
+				// local become primary
+				if(updateKeyValue(key, entry.value, PRIMARY)) {
+					log->logUpdateSuccess(&memberNode->addr, false, STABILIZER_ID, key, entry.value);
+				}
+				else {
+					log->logUpdateFail(&memberNode->addr, false, STABILIZER_ID, key, entry.value);
+				}
+				// node +1 was tertiary and become secondary
+				Message message(STABILIZER_ID, getMemberNode()->addr, MessageType::UPDATE, key, entry.value, ReplicaType::SECONDARY);
+				this->emulNet->ENsend(&memberNode->addr, &neighbors[N_PLUS_1].nodeAddress, message.toString());
+				// create tertiary
+				message.type = MessageType::CREATE;
+				message.replica = ReplicaType::TERTIARY;
+				this->emulNet->ENsend(&memberNode->addr, &neighbors[N_PLUS_2].nodeAddress, message.toString());
+			}
+			if(entry.replica == ReplicaType::TERTIARY) {
+				// we were the tertiary of node -2
+				// local become primary
+				if(updateKeyValue(key, entry.value, PRIMARY)) {
+					log->logUpdateSuccess(&memberNode->addr, false, STABILIZER_ID, key, entry.value);
+				} else {
+					log->logUpdateFail(&memberNode->addr, false, STABILIZER_ID, key, entry.value);
+				}
+				// create secondary
+				Message message(STABILIZER_ID, getMemberNode()->addr, MessageType::CREATE, key, entry.value, ReplicaType::SECONDARY);
+				this->emulNet->ENsend(&memberNode->addr, &neighbors[N_PLUS_1].nodeAddress, message.toString());
+				// create tertiary
+				message.replica = ReplicaType::TERTIARY;
+				this->emulNet->ENsend(&memberNode->addr, &neighbors[N_PLUS_2].nodeAddress, message.toString());
+			}
+		}
+	}
 
-	manageNeighbors();
+	//////////////////////////// My replicas
+	// only n+2 change
+	if(!isSameNode(hasMyReplicas[R_PLUS_2], neighbors[N_PLUS_2]) &&
+			isSameNode(hasMyReplicas[R_PLUS_1], neighbors[N_PLUS_1])) {
+		// new node as tertiary
+		log->LOG(&memberNode->addr, "stabilizationProtocol: only n+2 change");
+		for(map<string, string>::iterator it=ht->hashTable.begin(); it != ht->hashTable.end(); it++) {
+			Entry entry(it->second);
+			if(entry.replica == ReplicaType::PRIMARY) {
+				string key = it->first;
+				// create
+				Message message(STABILIZER_ID, getMemberNode()->addr, MessageType::CREATE, key, entry.value, ReplicaType::TERTIARY);
+				this->emulNet->ENsend(&memberNode->addr, &neighbors[N_PLUS_2].nodeAddress, message.toString());
+			}
+		}
+	}
+	// only n+1 leave
+	else if(!isSameNode(hasMyReplicas[R_PLUS_1], neighbors[N_PLUS_1]) &&
+		 isSameNode(hasMyReplicas[R_PLUS_2], neighbors[N_PLUS_1])) {
+		log->LOG(&memberNode->addr, "stabilizationProtocol: only n+1 leave");
+		for(map<string, string>::iterator it=ht->hashTable.begin(); it != ht->hashTable.end(); it++) {
+			Entry entry(it->second);
+			if(entry.replica == ReplicaType::PRIMARY) {
+				string key = it->first;
+				// old tertiary become secondary
+				Message message(STABILIZER_ID, getMemberNode()->addr, MessageType::UPDATE, key, entry.value, ReplicaType::SECONDARY);
+				this->emulNet->ENsend(&memberNode->addr, &neighbors[N_PLUS_1].nodeAddress, message.toString());
+				// new tertiary
+				message.type = MessageType::CREATE;
+				message.replica = ReplicaType::TERTIARY;
+				this->emulNet->ENsend(&memberNode->addr, &neighbors[N_PLUS_2].nodeAddress, message.toString());
+			}
+		}
+	}
+	// both nodes + 1 and + 2 change
+	else if(!isSameNode(hasMyReplicas[R_PLUS_2], neighbors[N_PLUS_2]) &&
+					!isSameNode(hasMyReplicas[R_PLUS_1], neighbors[N_PLUS_1])) {
+		log->LOG(&memberNode->addr, "stabilizationProtocol: both nodes + 1 and + 2 change");
+		for(map<string, string>::iterator it=ht->hashTable.begin(); it != ht->hashTable.end(); it++) {
+			Entry entry(it->second);
+			if(entry.replica == ReplicaType::PRIMARY) {
+				string key = it->first;
+				// create new secondary
+				Message message(STABILIZER_ID, getMemberNode()->addr, MessageType::CREATE, key, entry.value, ReplicaType::SECONDARY);
+				this->emulNet->ENsend(&memberNode->addr, &neighbors[N_PLUS_1].nodeAddress, message.toString());
+				// create new tertiary
+				message.replica = ReplicaType::TERTIARY;
+				this->emulNet->ENsend(&memberNode->addr, &neighbors[N_PLUS_2].nodeAddress, message.toString());
+			}
+		}
+	}
+	// new n+1 between us and old n+1
+	if(!isSameNode(hasMyReplicas[R_PLUS_1], neighbors[N_PLUS_1]) &&
+		 isSameNode(hasMyReplicas[R_PLUS_1], neighbors[N_PLUS_2])) {
+		log->LOG(&memberNode->addr, "stabilizationProtocol: new n+1 between us and old n+1");
+		for(map<string, string>::iterator it=ht->hashTable.begin(); it != ht->hashTable.end(); it++) {
+			Entry entry(it->second);
+			if(entry.replica == ReplicaType::PRIMARY) {
+				string key = it->first;
+				// new secondary
+				Message message(STABILIZER_ID, getMemberNode()->addr, MessageType::CREATE, key, entry.value, ReplicaType::SECONDARY);
+				this->emulNet->ENsend(&memberNode->addr, &neighbors[N_PLUS_1].nodeAddress, message.toString());
+				// old secondary become tertiary
+				message.type = MessageType::UPDATE;
+				message.replica = ReplicaType::TERTIARY;
+				this->emulNet->ENsend(&memberNode->addr, &neighbors[N_PLUS_2].nodeAddress, message.toString());
+				// delete old  tertiary
+				message.type = MessageType::DELETE;
+				message.replica = ReplicaType::TERTIARY;
+				this->emulNet->ENsend(&memberNode->addr, &hasMyReplicas[R_PLUS_2].nodeAddress, message.toString());
+			}
+		}
+	}
 }
 
 void MP2Node::manageNeighbors() {
@@ -509,7 +609,6 @@ void MP2Node::processReadMessage(Message *receivedMessage) {
 	}
 
 	Message reply(receivedMessage->transID, getMemberNode()->addr, value);
-
 	this->emulNet->ENsend(&memberNode->addr, &receivedMessage->fromAddr, reply.toString());
 }
 
@@ -534,7 +633,6 @@ void MP2Node::processUpdateMessage(Message *receivedMessage) {
 	}
 
 	Message reply(receivedMessage->transID, getMemberNode()->addr, MessageType::REPLY, isUpdatedSuccessfully);
-
 	this->emulNet->ENsend(&memberNode->addr, &receivedMessage->fromAddr, reply.toString());
 }
 
@@ -554,8 +652,7 @@ void MP2Node::processDeleteMessage(Message *receivedMessage) {
 		log->logDeleteFail(&this->memberNode->addr, false, receivedMessage->transID, receivedMessage->key);
 	}
 
-    Message reply(receivedMessage->transID, getMemberNode()->addr, MessageType::REPLY, isDeletedSuccessfully);
-
+  Message reply(receivedMessage->transID, getMemberNode()->addr, MessageType::REPLY, isDeletedSuccessfully);
 	this->emulNet->ENsend(&memberNode->addr, &receivedMessage->fromAddr, reply.toString());
 }
 
@@ -623,63 +720,67 @@ void MP2Node::pushNewTransactionInfo(string key, string value, int transID, Mess
 */
 void MP2Node::checkCoordinatorStatus() {
 	map<int, TransactionInfo>::iterator it;
-	for(it=transInfos.begin(); it != transInfos.end(); it++) {
+	for(it = transInfos.begin(); it != transInfos.end();) {
 		int transID = it->first;
 		TransactionInfo transInfo = it->second;
 		switch(transInfo.messageType) {
 			case MessageType::CREATE:
 				if(par->globaltime - transInfo.startTime > TIME_OUT || transInfo.failed) {
 					log->logCreateFail(&getMemberNode()->addr, true, transID, transInfo.key, transInfo.value);
-					transInfos.erase(transID);
-                    return;
+					it = transInfos.erase(it);
 				}
 				else {
 					if(transInfo.replyNumber == REPLICA_NB) {
 						log->logCreateSuccess(&getMemberNode()->addr, true, transID, transInfo.key, transInfo.value);
-						transInfos.erase(transID);
-                        return;
+						it = transInfos.erase(it);
+					}
+					else {
+						++it;
 					}
 				}
 				break;
 			case MessageType::UPDATE:
 				if(par->globaltime - transInfo.startTime > TIME_OUT || transInfo.failed) {
 					log->logUpdateFail(&getMemberNode()->addr, true, transID, transInfo.key, transInfo.value);
-					transInfos.erase(transID);
-                    return;
+					it = transInfos.erase(it);
 				}
 				else {
 					if(transInfo.replyNumber >= QUORUM) {
 						log->logUpdateSuccess(&getMemberNode()->addr, true, transID, transInfo.key, transInfo.value);
-						transInfos.erase(transID);
-                        return;
+						it = transInfos.erase(it);
+					}
+					else {
+						++it;
 					}
 				}
 				break;
 			case MessageType::READ:
 				if(par->globaltime - transInfo.startTime > TIME_OUT || transInfo.failed) {
 					log->logReadFail(&getMemberNode()->addr, true, transID, transInfo.key);
-					transInfos.erase(transID);
-                    return;
+					it = transInfos.erase(it);
 				}
 				else {
 					if(transInfo.replyNumber >= QUORUM) {
 						log->logReadSuccess(&getMemberNode()->addr, true, transID, transInfo.key, transInfo.value);
-						transInfos.erase(transID);
-                        return;
+						it = transInfos.erase(it);
+					}
+					else {
+						++it;
 					}
 				}
 				break;
 			case MessageType::DELETE:
 				if(par->globaltime - transInfo.startTime > TIME_OUT || transInfo.failed) {
 					log->logDeleteFail(&getMemberNode()->addr, true, transID, transInfo.key);
-					transInfos.erase(transID);
-                    return;
+					it = transInfos.erase(it);
 				}
 				else {
 					if(transInfo.replyNumber == REPLICA_NB) {
 						log->logDeleteSuccess(&getMemberNode()->addr, true, transID, transInfo.key);
-						transInfos.erase(transID);
-                        return;
+						it = transInfos.erase(it);
+					}
+					else {
+						++it;
 					}
 				}
 				break;
@@ -692,45 +793,45 @@ void MP2Node::checkCoordinatorStatus() {
 vector<Node> MP2Node::findNeighbors(vector<Node> nodes) {
 	vector<Node>::iterator forwardNode, backwardNode;
 
-    bool find = false;
+	bool find = false;
 	// search actual node
 	for(vector<Node>::iterator it=nodes.begin(); it != nodes.end(); it++) {
 		if(it->nodeAddress == memberNode->addr) {
 			forwardNode = it;
 			backwardNode = it;
-            find = true;
+      find = true;
 			break;
 		}
 	}
 
 	vector<Node> neighbors(4);
-    
-    if(find) {
-        if(backwardNode == nodes.begin()) {
-            backwardNode = nodes.end();
-        }
-        backwardNode--;
-        neighbors[N_MINUS_1] = *backwardNode;
 
-        if(backwardNode == nodes.begin()) {
-            backwardNode = nodes.end();
-        }
-        backwardNode--;
-        neighbors[N_MINUS_2] = *backwardNode;
+	if(find) {
+		if(backwardNode == nodes.begin()) {
+			backwardNode = nodes.end();
+		}
+		backwardNode--;
+		neighbors[N_MINUS_1] = *backwardNode;
 
-        forwardNode++;
-        if(forwardNode == nodes.end()) {
-            forwardNode = nodes.begin();
-        }
-        neighbors[N_PLUS_1] = *forwardNode;
+		if(backwardNode == nodes.begin()) {
+			backwardNode = nodes.end();
+		}
+		backwardNode--;
+		neighbors[N_MINUS_2] = *backwardNode;
 
-        forwardNode++;
-        if(forwardNode == nodes.end()) {
-            forwardNode = nodes.begin();
-        }
-        neighbors[N_PLUS_2] = *forwardNode;
-    }
-    
+		forwardNode++;
+		if(forwardNode == nodes.end()) {
+			forwardNode = nodes.begin();
+		}
+		neighbors[N_PLUS_1] = *forwardNode;
+
+		forwardNode++;
+		if(forwardNode == nodes.end()) {
+			forwardNode = nodes.begin();
+		}
+		neighbors[N_PLUS_2] = *forwardNode;
+	}
+
 	return neighbors;
 }
 
